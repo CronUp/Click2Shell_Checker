@@ -29,21 +29,19 @@ no login attempts) and reports whether a target is exposed to the chain.
 - Click2Shell core exposure check (WordPress < 7.1.1)
 - RCE-chain theme detection (`mobile-repair-zone` present on disk)
 - WAF / offline state detection (`BLOCKED` / `OFFLINE`) instead of a false "not WordPress"
-- Optional Cloudflare evasion via `curl_cffi` (`--impersonate`)
+- Cloudflare evasion via `curl_cffi` (Chrome impersonation, on by default)
 - Colored console output with a live progress bar
 - JSON, CSV, and minimalist HTML reports (sortable table, summary cards)
 
 ## Installation
 
 ```bash
-pip install requests colorama
-
-# Optional: Cloudflare evasion (TLS/HTTP2 browser impersonation)
-pip install curl_cffi
+pip install requests colorama curl_cffi
 ```
 
-`curl_cffi` is only required for the `--impersonate` flag. Without it, the
-checker falls back to plain `requests` automatically.
+`curl_cffi` is recommended: Chrome browser impersonation is **enabled by
+default** to reduce Cloudflare bot challenges. If it is not installed, the
+checker automatically falls back to plain `requests` (with a one-time notice).
 
 ## Usage
 
@@ -61,8 +59,8 @@ python click2shell_checker.py -l targets.txt --threads 20 \
 # Ignore TLS certificate errors
 python click2shell_checker.py -l targets.txt --insecure
 
-# Cloudflare evasion (impersonate a Chrome browser)
-python click2shell_checker.py -l targets.txt --impersonate
+# Disable Chrome impersonation (fall back to plain requests)
+python click2shell_checker.py -l targets.txt --no-impersonate
 ```
 
 Targets are cleaned automatically: schemes, uppercase, trailing slashes,
@@ -76,11 +74,11 @@ duplicates are removed by hostname.
 |---|---|
 | `-t, --target URL` | Single target |
 | `-l, --list FILE` | File with one target per line |
-| `--threads N` | Concurrent workers (default 10) |
+| `--threads N` | Concurrent workers (default 15) |
 | `--timeout N` | HTTP timeout in seconds (default 20) |
 | `--delay N` | Per-request courtesy delay in seconds |
 | `--insecure` | Ignore TLS certificate errors |
-| `--impersonate` | Impersonate a Chrome browser via `curl_cffi` to reduce Cloudflare bot challenges |
+| `--no-impersonate` | Disable Chrome browser impersonation (enabled by default via `curl_cffi`) |
 | `--no-chain` | Skip chain-theme detection (version only) |
 | `--prefer-https` | Keep the https entry when a host appears with both schemes |
 | `--no-color` | Disable ANSI colors |
@@ -121,8 +119,8 @@ a wrong version.
 **BLOCKED** means a bot/WAF challenge (Cloudflare and similar) hid the site from
 the passive scanner; **OFFLINE** means the target was unreachable. Both are
 reported separately (with a `?` in the `WP` column) instead of being mislabeled
-as "not WordPress". If a site is `BLOCKED`, retry with `--impersonate` (requires
-`curl_cffi`) to bypass the Cloudflare TLS/HTTP2 fingerprinting.
+as "not WordPress". Chrome impersonation is on by default — if a site is still
+`BLOCKED`, make sure `curl_cffi` is installed (`pip install curl_cffi`).
 
 ### Detection order (OpSec-friendly)
 
