@@ -151,11 +151,17 @@ RE_README_VERSION = re.compile(
     r"Version\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)",
     re.IGNORECASE,
 )
-RE_VER_QUERY = re.compile(
-    # Scoped like WPScan's QueryParameter finder: only accept ?v=/?ver=/?version=
-    # on URLs whose path clearly belongs to WordPress core/themes/plugins.
-    # Captures (path, version) so bundled third-party libraries can be filtered.
-    r'((?:wp-includes|wp-admin|wp-content)[^"\'\s>]*?)[?&](?:v|ver|version)=([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+# WordPress CORE assets whose ?ver= reliably reflects the WordPress version.
+# Whitelist (WPScan-style) that excludes:
+#   - wp-content  (theme/plugin assets carry their own version, e.g. ver=1.0)
+#   - bundled third-party libraries (jQuery 3.7.1, React, lodash, ...)
+RE_WP_VERSION_VER = re.compile(
+    r"(?:"
+    r"wp-includes/js/wp-embed[^\"'\s>]*|"  # wp-embed.min.js (ubiquitous)
+    r"wp-includes/css/dist/[^\"'\s>]*|"  # block-library CSS
+    r"wp-includes/js/dist/(?!vendor/)[^\"'\s>]*|"  # block editor JS (not vendor/)
+    r"wp-admin/(?:css|js)/[^\"'\s>]*"  # wp-admin core assets
+    r")[?&](?:v|ver|version)=([0-9]+\.[0-9]+(?:\.[0-9]+)?)",
     re.IGNORECASE,
 )
 RE_WP_INDICATOR = re.compile(
@@ -166,32 +172,13 @@ RE_THEME_VERSION = re.compile(
     re.IGNORECASE,
 )
 
-# Bundled third-party libraries whose ?ver= reflects their OWN version, not
-# the WordPress version (e.g. jquery.min.js?ver=3.7.1). Skipped in extraction.
-BUNDLED_LIB_HINTS = (
-    "jquery",
-    "dist/vendor",
-    "/vendor/",
-    "underscore",
-    "backbone",
-    "moment",
-    "lodash",
-    "react",
-    "twemoji",
-    "mediaelement",
-)
-
 
 def extract_wp_core_versions(html: str) -> set:
-    """Return WordPress version candidates from ?ver= on wp-* core assets,
-    excluding bundled third-party libraries that carry their own version."""
-    versions = set()
-    for m in RE_VER_QUERY.finditer(html):
-        path = m.group(1).lower()
-        if any(hint in path for hint in BUNDLED_LIB_HINTS):
-            continue
-        versions.add(m.group(2))
-    return versions
+    """Return WordPress version candidates from ?ver= on WordPress CORE
+    version-bearing assets only (wp-embed, block-library, block editor,
+    wp-admin). Theme/plugin assets and bundled libraries (jQuery, React, etc.)
+    are excluded because they carry their own version numbers."""
+    return set(RE_WP_VERSION_VER.findall(html))
 
 
 def detect_wp_base_paths(body: str) -> list:
@@ -800,8 +787,10 @@ def print_table(results: list):
             vuln, vcodes = "OFFLINE", (C.MAGENTA, C.BOLD)
         elif d.vulnerable_click2shell:
             vuln, vcodes = "VULNERABLE", (C.RED, C.BOLD)
-        elif d.is_wordpress:
+        elif d.is_wordpress and d.version:
             vuln, vcodes = "patched", (C.GREEN,)
+        elif d.is_wordpress:
+            vuln, vcodes = "UNKNOWN", (C.YELLOW,)
         else:
             vuln, vcodes = "-", (C.DIM,)
 
@@ -838,7 +827,7 @@ HTML_REPORT_CSS = """
   :root {
     --bg: #f7f8fa; --card: #ffffff; --border: #e6e8eb; --text: #1a1d21;
     --muted: #6b7280; --red: #e11d48; --green: #059669; --amber: #d97706;
-    --blue: #2563eb; --darkred: #9f1239; --navy: #0b2545;
+    --blue: #2563eb; --darkred: #9f1239; --navy: #0b2545; --slate: #64748b;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -865,6 +854,7 @@ HTML_REPORT_CSS = """
   .card.red .num { color: var(--red); } .card.green .num { color: var(--green); }
   .card.amber .num { color: var(--amber); } .card.blue .num { color: var(--blue); }
   .card.darkred .num { color: var(--darkred); }
+  .card.slate .num { color: var(--slate); }
   table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
   thead th { text-align: left; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--border); background: #fbfbfc; cursor: pointer; user-select: none; white-space: nowrap; }
   thead th:hover { color: var(--text); }
@@ -880,6 +870,7 @@ HTML_REPORT_CSS = """
   .b-open { background: #fffbeb; color: var(--amber); }
   .b-none { background: #f3f4f6; color: var(--muted); }
   .b-err { background: #fef2f2; color: var(--red); }
+  .b-offline { background: #f1f5f9; color: var(--slate); }
   .muted { color: var(--muted); }
   footer { margin-top: 1.75rem; color: var(--muted); font-size: 0.78rem; }
 """
@@ -921,7 +912,6 @@ def generate_html_report(
     n_wp = sum(1 for d in results if d.is_wordpress)
     n_vuln = sum(1 for d in results if d.vulnerable_click2shell)
     n_mrz = sum(1 for d in results if d.chain_theme_installed)
-    n_setup = sum(1 for d in results if d.setup_exposed)
     n_blocked = sum(1 for d in results if d.blocked)
     n_offline = sum(1 for d in results if d.offline)
 
@@ -935,11 +925,13 @@ def generate_html_report(
         elif d.blocked:
             status = '<span class="badge b-open">BLOCKED</span>'
         elif d.offline:
-            status = '<span class="badge b-err">OFFLINE</span>'
+            status = '<span class="badge b-offline">OFFLINE</span>'
         elif d.vulnerable_click2shell:
             status = '<span class="badge b-vuln">VULNERABLE</span>'
-        elif d.is_wordpress:
+        elif d.is_wordpress and d.version:
             status = '<span class="badge b-ok">patched</span>'
+        elif d.is_wordpress:
+            status = '<span class="badge b-open">UNKNOWN</span>'
         else:
             status = '<span class="badge b-none">n/a</span>'
 
@@ -999,9 +991,8 @@ def generate_html_report(
     <div class="card blue"><div class="num">{n_wp}</div><div class="lbl">WordPress</div></div>
     <div class="card red"><div class="num">{n_vuln}</div><div class="lbl">Vulnerable (RCE chain)</div></div>
     <div class="card darkred"><div class="num">{n_mrz}</div><div class="lbl">MRZ theme installed</div></div>
-    <div class="card amber"><div class="num">{n_setup}</div><div class="lbl">Setup open</div></div>
     <div class="card amber"><div class="num">{n_blocked}</div><div class="lbl">Blocked</div></div>
-    <div class="card red"><div class="num">{n_offline}</div><div class="lbl">Offline</div></div>
+    <div class="card slate"><div class="num">{n_offline}</div><div class="lbl">Offline</div></div>
   </section>
 
   <table id="results">
