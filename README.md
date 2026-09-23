@@ -7,9 +7,6 @@ Non-invasive WordPress version detector and exposure checker for the
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> **Authorized use only.** Run this tool only against systems you own or have
-> written authorization to test.
-
 ## Overview
 
 Click2Shell is a pre-authentication RCE chain in WordPress Core (fixed in
