@@ -388,22 +388,15 @@ def build_session(impersonate: bool = False):
 
     With impersonate=True, uses curl_cffi to impersonate a Chrome browser
     (TLS/HTTP2 fingerprint), which reduces Cloudflare bot challenges. Falls
-    back to plain requests if curl_cffi is not installed.
+    back to plain requests silently (availability is checked once upstream).
     """
     if impersonate:
         try:
             from curl_cffi import requests as cffi_requests
 
             return cffi_requests.Session(impersonate="chrome")
-        except ImportError:
-            print(
-                dim(
-                    "[!] curl_cffi not installed - falling back to requests. "
-                    "Install it with: pip install curl_cffi"
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(dim(f"[!] curl_cffi unavailable ({exc}) - falling back to requests."))
+        except Exception:  # noqa: BLE001
+            pass
 
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
@@ -1040,7 +1033,7 @@ def main():
     src.add_argument("-l", "--list", help="File with one target per line")
 
     ap.add_argument(
-        "--threads", type=int, default=10, help="Concurrent workers (default 10)"
+        "--threads", type=int, default=15, help="Concurrent workers (default 15)"
     )
     ap.add_argument(
         "--timeout", type=int, default=REQUEST_TIMEOUT, help="HTTP timeout seconds"
@@ -1055,9 +1048,9 @@ def main():
         "--insecure", action="store_true", help="Ignore TLS certificate errors"
     )
     ap.add_argument(
-        "--impersonate",
+        "--no-impersonate",
         action="store_true",
-        help="Impersonate a Chrome browser via curl_cffi to reduce Cloudflare bot challenges",
+        help="Disable Chrome browser impersonation (uses plain requests)",
     )
     ap.add_argument(
         "--no-chain",
@@ -1099,6 +1092,22 @@ def main():
     if _COLORAMA:
         just_fix_windows_console()
     USE_COLOR = (not args.no_color) and sys.stdout.isatty()
+
+    # Chrome impersonation is ON by default (reduces Cloudflare challenges).
+    # Detect curl_cffi availability once and fall back to plain requests if absent.
+    use_impersonate = False
+    if not args.no_impersonate:
+        try:
+            import curl_cffi  # noqa: F401
+
+            use_impersonate = True
+        except ImportError:
+            print(
+                dim(
+                    "[!] curl_cffi not installed - using plain requests. "
+                    "Install with: pip install curl_cffi for Cloudflare evasion."
+                )
+            )
 
     # PoC-only mode
     if args.poc:
@@ -1154,12 +1163,7 @@ def main():
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
         futs = {
             ex.submit(
-                scan_target,
-                t,
-                verify,
-                args.timeout,
-                not args.no_chain,
-                args.impersonate,
+                scan_target, t, verify, args.timeout, not args.no_chain, use_impersonate
             ): t
             for t in targets
         }
