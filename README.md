@@ -99,7 +99,7 @@ duplicates are removed by hostname.
 | `TARGET` | Normalized target URL |
 | `WP` | Whether WordPress is confirmed |
 | `VERSION` | Detected WordPress version |
-| `RISK` | `VULNERABLE` (core < 7.1.1) / `patched` / `BLOCKED` / `OFFLINE` / `-` |
+| `RISK` | `VULNERABLE` (core < 7.1.1) / `patched` / `UNKNOWN` / `BLOCKED` / `OFFLINE` / `-` |
 | `MRZ-THEME` | `installed` if `mobile-repair-zone` is on disk, else `-` |
 | `SETUP` | `OPEN` if WordPress is not installed yet |
 | `SOURCE` | Where the version was detected |
@@ -112,6 +112,11 @@ theme from the catalog by itself.
 
 **SETUP = OPEN** means `/wp-admin/install.php` exposes the installer, i.e.
 WordPress is not yet configured and anyone could complete the installation.
+
+**UNKNOWN** means WordPress was confirmed but its version could not be
+determined passively (meta generator removed, `?ver=` replaced by content
+hashes, `readme.html` blocked, etc.). It is reported as-is instead of guessing
+a wrong version.
 
 **BLOCKED** means a bot/WAF challenge (Cloudflare and similar) hid the site from
 the passive scanner; **OFFLINE** means the target was unreachable. Both are
@@ -145,10 +150,11 @@ The checker is polite by design:
 
 Version and vulnerability are reported only after WordPress is confirmed
 (generator meta, readme, feed/opml, login form, REST API, XML-RPC, or
-installer). The `?ver=` heuristic is restricted to `wp-includes`, `wp-admin`
-and `wp-content` paths, and bundled third-party libraries (jQuery, React,
-etc.) are excluded because they carry their own version numbers, not the
-WordPress version.
+installer). The `?ver=` heuristic uses a whitelist of WordPress CORE assets
+(`wp-embed`, `block-library`, block-editor, `wp-admin`) whose version matches
+the WordPress release; theme/plugin assets (`wp-content`) and bundled
+libraries (jQuery, React, etc.) are ignored because they carry their own
+version numbers.
 
 If WordPress lives in a subdirectory (e.g. `/global/`, `/blog/`), the base
 path is detected from asset URLs in the homepage and every endpoint is probed
