@@ -154,8 +154,8 @@ RE_README_VERSION = re.compile(
 RE_VER_QUERY = re.compile(
     # Scoped like WPScan's QueryParameter finder: only accept ?v=/?ver=/?version=
     # on URLs whose path clearly belongs to WordPress core/themes/plugins.
-    # This prevents false positives from generic cache-buster ?ver= on non-WP sites.
-    r'(?:wp-includes|wp-admin|wp-content)[^"\'\s>]*?[?&](?:v|ver|version)=([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+    # Captures (path, version) so bundled third-party libraries can be filtered.
+    r'((?:wp-includes|wp-admin|wp-content)[^"\'\s>]*?)[?&](?:v|ver|version)=([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
     re.IGNORECASE,
 )
 RE_WP_INDICATOR = re.compile(
@@ -166,8 +166,76 @@ RE_THEME_VERSION = re.compile(
     re.IGNORECASE,
 )
 
-# Core asset paths whose ?ver= reflects the WordPress core version.
-CORE_ASSET_HINTS = ("wp-includes", "wp-admin", "wp-content/themes/twentytwenty")
+# Bundled third-party libraries whose ?ver= reflects their OWN version, not
+# the WordPress version (e.g. jquery.min.js?ver=3.7.1). Skipped in extraction.
+BUNDLED_LIB_HINTS = (
+    "jquery",
+    "dist/vendor",
+    "/vendor/",
+    "underscore",
+    "backbone",
+    "moment",
+    "lodash",
+    "react",
+    "twemoji",
+    "mediaelement",
+)
+
+
+def extract_wp_core_versions(html: str) -> set:
+    """Return WordPress version candidates from ?ver= on wp-* core assets,
+    excluding bundled third-party libraries that carry their own version."""
+    versions = set()
+    for m in RE_VER_QUERY.finditer(html):
+        path = m.group(1).lower()
+        if any(hint in path for hint in BUNDLED_LIB_HINTS):
+            continue
+        versions.add(m.group(2))
+    return versions
+
+
+def detect_wp_base_paths(body: str) -> list:
+    """Detect the WordPress base path(s) from asset URLs in the HTML.
+
+    Supports subdirectory installs (e.g. /global/, /blog/, /wp/). Returns a
+    sorted list of path prefixes (non-root first, '' for root installs).
+    """
+    found = set()
+    for m in re.finditer(
+        r'([^\s"\'<>()]+)/(?:wp-includes|wp-content|wp-admin|wp-json)/',
+        body,
+        re.IGNORECASE,
+    ):
+        token = m.group(1)
+        if token.startswith("//"):
+            p = urlparse("http:" + token).path
+        elif "://" in token:
+            p = urlparse(token).path
+        else:
+            p = token
+        found.add(p.rstrip("/"))
+    # Non-root paths first (most specific), then root last.
+    return sorted(found, key=lambda p: (p == "", len(p)))
+
+
+# Markers of bot-protection / WAF challenge pages (Cloudflare & co.) that hide
+# the real site from passive HTTP clients (no JS / cookies).
+WAF_CHALLENGE_HINTS = (
+    "just a moment",
+    "cf-chl-",
+    "__cf_chl",
+    "cf-browser-verification",
+    "enable javascript and cookies",
+    "attention required",
+    "captcha-delivery",
+    "access denied",
+)
+
+
+def is_waf_challenge(html: str) -> bool:
+    """True if the page looks like a bot-protection challenge, not real content."""
+    low = html[:8000].lower()
+    return any(hint in low for hint in WAF_CHALLENGE_HINTS)
 
 
 # --------------------------------------------------------------------------- #
@@ -188,6 +256,8 @@ class Detection:
     chain_theme_installed: bool = False
     chain_theme_version: Optional[str] = None
     setup_exposed: bool = False  # WordPress not-yet-installed (install.php reachable)
+    blocked: bool = False  # bot/WAF challenge (e.g. Cloudflare) — can't fingerprint
+    offline: bool = False  # unreachable (DNS/connection/timeout)
     http_status: int = 0
     error: Optional[str] = None
     evidence: dict = field(default_factory=dict)
@@ -326,44 +396,52 @@ def is_older(candidate, baseline) -> bool:
     return cand < base
 
 
-def fetch(session: requests.Session, url: str, timeout: int, verify: bool):
+def build_session(impersonate: bool = False):
+    """Build an HTTP session with sensible defaults.
+
+    With impersonate=True, uses curl_cffi to impersonate a Chrome browser
+    (TLS/HTTP2 fingerprint), which reduces Cloudflare bot challenges. Falls
+    back to plain requests if curl_cffi is not installed.
+    """
+    if impersonate:
+        try:
+            from curl_cffi import requests as cffi_requests
+
+            return cffi_requests.Session(impersonate="chrome")
+        except ImportError:
+            print(
+                dim(
+                    "[!] curl_cffi not installed - falling back to requests. "
+                    "Install it with: pip install curl_cffi"
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(dim(f"[!] curl_cffi unavailable ({exc}) - falling back to requests."))
+
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+    return s
+
+
+def fetch(session, url: str, timeout: int, verify: bool):
     """GET with a polite delay. Returns Response or None on failure."""
     if POLITE_DELAY > 0:
         time.sleep(POLITE_DELAY)
     try:
-        resp = session.get(
-            url,
-            timeout=timeout,
-            verify=verify,
-            allow_redirects=True,
-            headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
-        )
-        return resp
-    except requests.RequestException:
+        return session.get(url, timeout=timeout, verify=verify, allow_redirects=True)
+    except Exception:  # noqa: BLE001
         return None
-
-
-def extract_version_candidates(html: str) -> list:
-    """Pull every plausible WP version string from a body of text."""
-    candidates = []
-    m = RE_META_GENERATOR.search(html)
-    if m:
-        candidates.append(m.group(1))
-    for m in RE_RSS_GENERATOR.finditer(html):
-        candidates.append(m.group(1))
-    for m in RE_README_VERSION.finditer(html):
-        candidates.append(m.group(1))
-    # ver= query strings from core assets only
-    for m in RE_VER_QUERY.finditer(html):
-        candidates.append(m.group(1))
-    return candidates
 
 
 # --------------------------------------------------------------------------- #
 # Per-target scan
 # --------------------------------------------------------------------------- #
 def scan_target(
-    target: str, verify: bool, timeout: int, check_chain: bool
+    target: str,
+    verify: bool,
+    timeout: int,
+    check_chain: bool,
+    impersonate: bool = False,
 ) -> Detection:
     base = normalize_url(target)
     det = Detection(target=base)
@@ -371,88 +449,158 @@ def scan_target(
         det.error = "invalid target"
         return det
 
-    session = requests.Session()
+    session = build_session(impersonate)
     candidates: dict = {}  # source -> version (readme > meta > feed > opml > asset)
     strong = 0  # definitive WordPress signals (any one => it IS WordPress)
     weak = 0  # suggestive signals (homepage wp-* path references)
+    detected_path = ""  # confirmed WordPress base path ('' = root)
 
-    # --- 1. Homepage -------------------------------------------------------
-    resp = fetch(session, base + "/", timeout, verify)
-    if resp is not None:
-        det.http_status = resp.status_code
-        body = resp.text[:400000]
-        # Distinct wp-* path references (weak, non-definitive on their own).
-        weak = len(set(m.group(0).lower() for m in RE_WP_INDICATOR.finditer(body)))
-        m = RE_META_GENERATOR.search(body)
-        if m:
-            strong += 1  # generator meta explicitly says "WordPress X.Y.Z"
-            candidates.setdefault("meta", m.group(1))
-        # Core asset ver= strings (already scoped to wp-* paths by the regex).
-        for am in RE_VER_QUERY.finditer(body):
-            candidates.setdefault("asset", set()).add(am.group(1))
+    # ==================================================================== #
+    # Phase 1 — clean single request: analyze the homepage source code only.
+    # This must stay the FIRST (and often only) connection so that sensitive
+    # files are not touched until strictly necessary.
+    # ==================================================================== #
+    try:
+        resp = session.get(
+            base + "/",
+            timeout=timeout,
+            verify=verify,
+            allow_redirects=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        # Backend-agnostic classification (works for requests and curl_cffi).
+        name = type(e).__name__.lower()
+        if "ssl" in name or "certificate" in name:
+            det.error = "TLS error (use --insecure)"
+        elif any(
+            k in name
+            for k in ("timeout", "connect", "dns", "gai", "resolve", "refused")
+        ):
+            det.offline = True
+            det.evidence["offline"] = type(e).__name__
+        else:
+            det.error = str(e)
+        session.close()
+        return det
 
-    # --- 2. readme.html (most reliable) -----------------------------------
-    resp = fetch(session, base + "/readme.html", timeout, verify)
-    if resp is not None and resp.status_code == 200:
-        m = RE_README_VERSION.search(resp.text[:20000])
-        if m:
-            candidates["readme"] = m.group(1)
-        if "wordpress" in resp.text[:2000].lower():
+    det.http_status = resp.status_code
+    body = resp.text[:400000]
+    wp_paths = [""]
+
+    # Bot/WAF challenge (Cloudflare etc.) hides the real site from us.
+    if is_waf_challenge(body):
+        det.blocked = True
+        det.evidence["waf_challenge"] = True
+        session.close()
+        return det
+
+    # Distinct wp-* path references (weak, non-definitive on their own).
+    weak = len(set(m.group(0).lower() for m in RE_WP_INDICATOR.finditer(body)))
+    m = RE_META_GENERATOR.search(body)
+    if m:
+        strong += 1  # generator meta explicitly says "WordPress X.Y.Z"
+        candidates.setdefault("meta", m.group(1))
+    # Core asset ver= strings (bundled libs like jQuery filtered out).
+    candidates.setdefault("asset", set()).update(extract_wp_core_versions(body))
+    wp_paths = detect_wp_base_paths(body) or [""]
+    if "" not in wp_paths:
+        wp_paths.append("")  # root as last-resort fallback
+
+    # ==================================================================== #
+    # Phase 2 — safe public endpoints (feed, OPML, REST API). Low WAF risk.
+    # ==================================================================== #
+    for wp_path in wp_paths:
+        wp_base = base + wp_path
+
+        # RSS feed generator
+        r = fetch(session, wp_base + "/feed/", timeout, verify)
+        if r is not None and r.status_code == 200:
+            mm = RE_RSS_GENERATOR.search(r.text[:50000])
+            if mm:
+                strong += 1  # <generator>https://wordpress.org/?v=...
+                candidates.setdefault("feed", mm.group(1))
+
+        # wp-links-opml.php generator
+        r = fetch(session, wp_base + "/wp-links-opml.php", timeout, verify)
+        if r is not None and r.status_code == 200:
+            mm = RE_RSS_GENERATOR.search(r.text[:20000])
+            if mm:
+                strong += 1
+                candidates.setdefault("opml", mm.group(1))
+
+        # REST API
+        r = fetch(session, wp_base + "/wp-json/", timeout, verify)
+        if (
+            r is not None
+            and r.status_code == 200
+            and ("namespaces" in r.text[:2000] or "routes" in r.text[:2000])
+        ):
             strong += 1
 
-    # --- 3. RSS feed generator -------------------------------------------
-    resp = fetch(session, base + "/feed/", timeout, verify)
-    if resp is not None and resp.status_code == 200:
-        m = RE_RSS_GENERATOR.search(resp.text[:50000])
-        if m:
-            strong += 1  # <generator>https://wordpress.org/?v=...
-            candidates.setdefault("feed", m.group(1))
+        if strong >= 1:
+            detected_path = wp_path
+            break
 
-    # --- 3b. wp-links-opml.php generator ----------------------------------
-    resp = fetch(session, base + "/wp-links-opml.php", timeout, verify)
-    if resp is not None and resp.status_code == 200:
-        m = RE_RSS_GENERATOR.search(resp.text[:20000])
-        if m:
-            strong += 1
-            candidates.setdefault("opml", m.group(1))
+    # ==================================================================== #
+    # Phase 3 — sensitive files, only if version/confirmation still missing.
+    # readme.html / wp-admin / wp-login / xmlrpc.php can trip a WAF, so they
+    # are touched last (and only when we have a WordPress hint).
+    # ==================================================================== #
+    have_version = bool(
+        candidates.get("meta")
+        or candidates.get("feed")
+        or candidates.get("opml")
+        or candidates.get("asset")
+    )
+    confirmed = (strong >= 1) or (weak >= 2)
+    has_hint = (weak >= 1) or (strong >= 1)
 
-    # --- 3c. wp-admin/install.php -----------------------------------------
-    resp = fetch(session, base + "/wp-admin/install.php", timeout, verify)
-    if resp is not None and resp.status_code == 200:
-        body = resp.text[:30000]
-        low = body.lower()
-        if 'name="weblog_title"' in body or "install wordpress" in low:
-            det.setup_exposed = True
-        m = RE_GENERIC_WP_VERSION.search(body)
-        if m:
-            candidates.setdefault("install", m.group(1))
-        if "already installed" in low:
-            strong += 1  # installer reachable => WordPress present
+    if has_hint and not (have_version and confirmed):
+        for wp_path in wp_paths:
+            wp_base = base + wp_path
 
-    # --- 4. wp-login.php --------------------------------------------------
-    resp = fetch(session, base + "/wp-login.php", timeout, verify)
-    if resp is not None and resp.status_code == 200:
-        body = resp.text[:200000]
-        if "wp-submit" in body or "user_login" in body:
-            strong += 1  # real WordPress login form
-        for am in RE_VER_QUERY.finditer(body):
-            candidates.setdefault("login_asset", set()).add(am.group(1))
+            # readme.html (most reliable version leak)
+            r = fetch(session, wp_base + "/readme.html", timeout, verify)
+            if r is not None and r.status_code == 200:
+                mm = RE_README_VERSION.search(r.text[:20000])
+                if mm:
+                    candidates["readme"] = mm.group(1)
+                if "wordpress" in r.text[:2000].lower():
+                    strong += 1
 
-    # --- 4b. xmlrpc.php ---------------------------------------------------
-    resp = fetch(session, base + "/xmlrpc.php", timeout, verify)
-    if resp is not None and resp.status_code in (200, 405):
-        txt = resp.text[:2000].lower()
-        if "xmlrpc" in txt or "xml-rpc" in txt or "system.listmethods" in txt:
-            strong += 1
+            # xmlrpc.php
+            r = fetch(session, wp_base + "/xmlrpc.php", timeout, verify)
+            if r is not None and r.status_code in (200, 405):
+                txt = r.text[:2000].lower()
+                if "xmlrpc" in txt or "xml-rpc" in txt or "system.listmethods" in txt:
+                    strong += 1
 
-    # --- 5. REST API ------------------------------------------------------
-    resp = fetch(session, base + "/wp-json/", timeout, verify)
-    if (
-        resp is not None
-        and resp.status_code == 200
-        and ("namespaces" in resp.text[:2000] or "routes" in resp.text[:2000])
-    ):
-        strong += 1
+            # wp-login.php
+            r = fetch(session, wp_base + "/wp-login.php", timeout, verify)
+            if r is not None and r.status_code == 200:
+                lbody = r.text[:200000]
+                if "wp-submit" in lbody or "user_login" in lbody:
+                    strong += 1  # real WordPress login form
+                candidates.setdefault("login_asset", set()).update(
+                    extract_wp_core_versions(lbody)
+                )
+
+            # wp-admin/install.php
+            r = fetch(session, wp_base + "/wp-admin/install.php", timeout, verify)
+            if r is not None and r.status_code == 200:
+                ibody = r.text[:30000]
+                ilow = ibody.lower()
+                if 'name="weblog_title"' in ibody or "install wordpress" in ilow:
+                    det.setup_exposed = True
+                mm = RE_GENERIC_WP_VERSION.search(ibody)
+                if mm:
+                    candidates.setdefault("install", mm.group(1))
+                if "already installed" in ilow:
+                    strong += 1  # installer reachable => WordPress present
+
+            if strong >= 1:
+                detected_path = wp_path
+                break
 
     # Confirmation: one definitive signal, or two+ suggestive ones.
     det.is_wordpress = (strong >= 1) or (weak >= 2)
@@ -487,6 +635,7 @@ def scan_target(
         k: (sorted(v) if isinstance(v, set) else v) for k, v in candidates.items()
     }
     det.evidence["wp_signals"] = {"strong": strong, "weak": weak}
+    det.evidence["wp_path"] = detected_path
 
     # Vulnerability ONLY if WordPress is confirmed AND version < 7.1.1.
     det.vulnerable_click2shell = det.is_wordpress and is_older(
@@ -495,7 +644,7 @@ def scan_target(
 
     # --- Chain theme detection --------------------------------------------
     if check_chain and det.vulnerable_click2shell:
-        theme_url = base + f"/wp-content/themes/{CHAIN_THEME}/style.css"
+        theme_url = base + detected_path + f"/wp-content/themes/{CHAIN_THEME}/style.css"
         resp = fetch(session, theme_url, timeout, verify)
         if resp is not None and resp.status_code == 200:
             det.chain_theme_installed = True
@@ -638,13 +787,17 @@ def print_table(results: list):
     print("\n" + " ".join(hdr))
     print(dim("-" * (sum(W) + len(W) - 1)))
     for d in results:
-        wp = "yes" if d.is_wordpress else "no"
+        wp = "?" if (d.blocked or d.offline) else ("yes" if d.is_wordpress else "no")
         ver = d.version or "-"
 
         # RISK = the Click2Shell core primitive (< 7.1.1), which is the RCE
         # chain entry point regardless of whether the theme is already on disk.
         if d.error:
             vuln, vcodes = "ERR", (C.RED, C.BOLD)
+        elif d.blocked:
+            vuln, vcodes = "BLOCKED", (C.YELLOW, C.BOLD)
+        elif d.offline:
+            vuln, vcodes = "OFFLINE", (C.MAGENTA, C.BOLD)
         elif d.vulnerable_click2shell:
             vuln, vcodes = "VULNERABLE", (C.RED, C.BOLD)
         elif d.is_wordpress:
@@ -654,7 +807,13 @@ def print_table(results: list):
 
         row = [
             _fmt(d.target, W[0]),
-            _fmt(wp, W[1], C.GREEN if d.is_wordpress else C.DIM),
+            _fmt(
+                wp,
+                W[1],
+                C.GREEN
+                if d.is_wordpress
+                else (C.DIM if not (d.blocked or d.offline) else C.YELLOW),
+            ),
             _fmt(ver, W[2], C.BOLD if d.version else C.DIM),
             _fmt(vuln, W[3], *vcodes),
             _fmt(
@@ -707,7 +866,9 @@ HTML_REPORT_CSS = """
   .card.amber .num { color: var(--amber); } .card.blue .num { color: var(--blue); }
   .card.darkred .num { color: var(--darkred); }
   table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-  thead th { text-align: left; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--border); background: #fbfbfc; }
+  thead th { text-align: left; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--border); background: #fbfbfc; cursor: pointer; user-select: none; white-space: nowrap; }
+  thead th:hover { color: var(--text); }
+  thead th .arrow { color: var(--blue); margin-left: 0.25rem; }
   tbody td { padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
   tbody tr:last-child td { border-bottom: 0; }
   tbody tr:hover { background: #fafbfc; }
@@ -723,6 +884,31 @@ HTML_REPORT_CSS = """
   footer { margin-top: 1.75rem; color: var(--muted); font-size: 0.78rem; }
 """
 
+# Client-side table sorting (self-contained, no external libraries).
+SORT_TABLE_JS = """
+function sortTable(col) {
+  var table = document.getElementById('results');
+  if (!table) return;
+  var tbody = table.tBodies[0];
+  var rows = Array.prototype.slice.call(tbody.rows);
+  var asc = (table.dataset.col == col) ? !(table.dataset.asc == 'true') : true;
+  rows.sort(function(a, b) {
+    var x = a.cells[col].textContent.trim();
+    var y = b.cells[col].textContent.trim();
+    return x.localeCompare(y, undefined, {numeric: true, sensitivity: 'base'});
+  });
+  if (!asc) rows.reverse();
+  rows.forEach(function(r) { tbody.appendChild(r); });
+  table.dataset.col = col;
+  table.dataset.asc = asc;
+  var ths = table.querySelectorAll('thead th');
+  ths.forEach(function(th, i) {
+    var label = th.getAttribute('data-label') || th.textContent;
+    th.innerHTML = label + (i === col ? '<span class="arrow">' + (asc ? '▲' : '▼') + '</span>' : '');
+  });
+}
+"""
+
 
 def generate_html_report(
     results: list,
@@ -736,6 +922,8 @@ def generate_html_report(
     n_vuln = sum(1 for d in results if d.vulnerable_click2shell)
     n_mrz = sum(1 for d in results if d.chain_theme_installed)
     n_setup = sum(1 for d in results if d.setup_exposed)
+    n_blocked = sum(1 for d in results if d.blocked)
+    n_offline = sum(1 for d in results if d.offline)
 
     def esc(s):
         return html_lib.escape(str(s)) if s is not None else ""
@@ -744,6 +932,10 @@ def generate_html_report(
     for d in results:
         if d.error:
             status = '<span class="badge b-err">ERROR</span>'
+        elif d.blocked:
+            status = '<span class="badge b-open">BLOCKED</span>'
+        elif d.offline:
+            status = '<span class="badge b-err">OFFLINE</span>'
         elif d.vulnerable_click2shell:
             status = '<span class="badge b-vuln">VULNERABLE</span>'
         elif d.is_wordpress:
@@ -751,6 +943,7 @@ def generate_html_report(
         else:
             status = '<span class="badge b-none">n/a</span>'
 
+        wp = "?" if (d.blocked or d.offline) else ("yes" if d.is_wordpress else "no")
         mrz = (
             '<span class="badge b-open">installed</span>'
             if d.chain_theme_installed
@@ -766,7 +959,7 @@ def generate_html_report(
             version = f"<strong>{version}</strong>"
         rows.append(
             f"<tr><td class='target'>{esc(d.target)}</td>"
-            f"<td>{esc('yes' if d.is_wordpress else 'no')}</td>"
+            f"<td>{esc(wp)}</td>"
             f"<td>{version}</td><td>{status}</td><td>{mrz}</td>"
             f"<td>{setup}</td><td class='muted'>{esc(d.version_source or '-')}</td></tr>"
         )
@@ -807,16 +1000,27 @@ def generate_html_report(
     <div class="card red"><div class="num">{n_vuln}</div><div class="lbl">Vulnerable (RCE chain)</div></div>
     <div class="card darkred"><div class="num">{n_mrz}</div><div class="lbl">MRZ theme installed</div></div>
     <div class="card amber"><div class="num">{n_setup}</div><div class="lbl">Setup open</div></div>
+    <div class="card amber"><div class="num">{n_blocked}</div><div class="lbl">Blocked</div></div>
+    <div class="card red"><div class="num">{n_offline}</div><div class="lbl">Offline</div></div>
   </section>
 
-  <table>
-    <thead><tr><th>Target</th><th>WP</th><th>Version</th><th>Status</th><th>MRZ theme</th><th>Setup</th><th>Source</th></tr></thead>
+  <table id="results">
+    <thead><tr>
+      <th data-label="Target" onclick="sortTable(0)">Target</th>
+      <th data-label="WP" onclick="sortTable(1)">WP</th>
+      <th data-label="Version" onclick="sortTable(2)">Version</th>
+      <th data-label="Status" onclick="sortTable(3)">Status</th>
+      <th data-label="MRZ theme" onclick="sortTable(4)">MRZ theme</th>
+      <th data-label="Setup" onclick="sortTable(5)">Setup</th>
+      <th data-label="Source" onclick="sortTable(6)">Source</th>
+    </tr></thead>
     <tbody>{"".join(rows)}</tbody>
   </table>
   {skipped_rows}
 
   <footer>Click2Shell Checker &middot; CronUp Cybersecurity &middot; Authorized use only &middot; Passive WordPress version detection.</footer>
 </div>
+<script>{SORT_TABLE_JS}</script>
 </body>
 </html>"""
     with open(out_path, "w", encoding="utf-8") as f:
@@ -858,6 +1062,11 @@ def main():
     )
     ap.add_argument(
         "--insecure", action="store_true", help="Ignore TLS certificate errors"
+    )
+    ap.add_argument(
+        "--impersonate",
+        action="store_true",
+        help="Impersonate a Chrome browser via curl_cffi to reduce Cloudflare bot challenges",
     )
     ap.add_argument(
         "--no-chain",
@@ -953,7 +1162,14 @@ def main():
     done = 0
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
         futs = {
-            ex.submit(scan_target, t, verify, args.timeout, not args.no_chain): t
+            ex.submit(
+                scan_target,
+                t,
+                verify,
+                args.timeout,
+                not args.no_chain,
+                args.impersonate,
+            ): t
             for t in targets
         }
         for fut in as_completed(futs):
@@ -978,6 +1194,8 @@ def main():
     mrz = [d for d in results if d.chain_theme_installed]
     wp = [d for d in results if d.is_wordpress]
     setup = [d for d in results if d.setup_exposed]
+    blocked = [d for d in results if d.blocked]
+    offline = [d for d in results if d.offline]
     print(
         "\n"
         + bold(f"[+] WordPress sites: {green(str(len(wp)))}")
@@ -987,6 +1205,10 @@ def main():
         + bold(f"MRZ theme installed: {magenta(str(len(mrz)))}")
         + " | "
         + bold(f"Setup open: {yellow(str(len(setup)))}")
+        + " | "
+        + bold(f"Blocked: {yellow(str(len(blocked)))}")
+        + " | "
+        + bold(f"Offline: {magenta(str(len(offline)))}")
     )
     if vuln:
         print(
@@ -994,6 +1216,13 @@ def main():
                 "[!] VULNERABLE = forced theme-install primitive (High) that chains "
                 "to RCE (Critical). 'MRZ installed' = chain ready locally; if absent, "
                 "the core bug downloads the vulnerable theme from the catalog."
+            )
+        )
+    if blocked or offline:
+        print(
+            dim(
+                "[!] BLOCKED = bot/WAF challenge (Cloudflare etc.) hid the site; "
+                "OFFLINE = unreachable. Re-run those manually or with --insecure."
             )
         )
 
@@ -1024,6 +1253,8 @@ def main():
                     "chain_theme_installed",
                     "chain_theme_version",
                     "setup_exposed",
+                    "blocked",
+                    "offline",
                     "http_status",
                     "error",
                 ],
