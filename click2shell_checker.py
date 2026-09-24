@@ -399,8 +399,24 @@ def build_session(impersonate: bool = False):
             pass
 
     s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+    s.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*", "Connection": "close"})
+    # Each thread owns its session; a minimal pool prevents urllib3 pool
+    # exhaustion when many threads run in parallel on Windows.
+    # Connection: close forces TCP teardown after each response, releasing
+    # ephemeral ports immediately — critical with high thread counts.
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=1,
+        pool_maxsize=1,
+        max_retries=0,
+    )
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
     return s
+
+
+def _timeout(timeout: int) -> tuple:
+    """Split into (connect_timeout, read_timeout) to avoid silent hangs."""
+    return (min(5, timeout), timeout)
 
 
 def fetch(session, url: str, timeout: int, verify: bool):
@@ -408,7 +424,9 @@ def fetch(session, url: str, timeout: int, verify: bool):
     if POLITE_DELAY > 0:
         time.sleep(POLITE_DELAY)
     try:
-        return session.get(url, timeout=timeout, verify=verify, allow_redirects=True)
+        return session.get(
+            url, timeout=_timeout(timeout), verify=verify, allow_redirects=True
+        )
     except Exception:  # noqa: BLE001
         return None
 
@@ -443,7 +461,7 @@ def scan_target(
     try:
         resp = session.get(
             base + "/",
-            timeout=timeout,
+            timeout=_timeout(timeout),
             verify=verify,
             allow_redirects=True,
         )
